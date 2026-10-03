@@ -1,9 +1,11 @@
 pub mod cluster_config;
 pub mod node_config;
+pub mod runtime_config;
 pub mod validation;
 
 pub use cluster_config::ClusterConfig;
 pub use node_config::NodeConfig;
+pub use runtime_config::RuntimeConfig;
 pub use validation::{ConfigError, has_odd_cluster_size, validate_cluster};
 
 #[cfg(test)]
