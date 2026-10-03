@@ -1,5 +1,6 @@
 use std::fmt;
 
+use crate::config::cluster_config::ClusterConfig;
 use crate::raft::types::NodeId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +29,6 @@ impl fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
-use crate::config::cluster_config::ClusterConfig;
 
 pub fn validate_cluster(config: &ClusterConfig) -> Result<(), ConfigError> {
     if config.node_count() == 0 {
