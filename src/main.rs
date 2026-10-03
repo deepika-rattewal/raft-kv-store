@@ -1,3 +1,3 @@
 fn main() {
-    println!("Raft KV Store node starting...");
+    println!("Raft KV Store starting...");
 }
