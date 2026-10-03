@@ -118,6 +118,21 @@ impl NodeTransport {
         let envelope = NetworkEnvelope::new(sender, response.into());
         self.send_to_peer(peer, &envelope).await
     }
+
+    pub fn from_cluster_config(
+        config: &crate::config::ClusterConfig,
+        node_id: NodeId,
+    ) -> Option<Self> {
+        let node = config.find_node(node_id)?;
+
+        let mut transport = Self::new(node.address());
+
+        for peer in config.peer_nodes(node_id) {
+            transport.add_peer(peer.node_id(), peer.address());
+        }
+
+        Some(transport)
+    }
 }
 
 #[cfg(test)]
@@ -370,5 +385,40 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().to_string(), "unknown peer: 99");
+    }
+
+    #[test]
+    fn from_cluster_config_builds_peer_addresses() {
+        let config = crate::config::ClusterConfig::new(vec![
+            crate::config::NodeConfig::new(NodeId::new(1), "127.0.0.1:7001".parse().unwrap()),
+            crate::config::NodeConfig::new(NodeId::new(2), "127.0.0.1:7002".parse().unwrap()),
+            crate::config::NodeConfig::new(NodeId::new(3), "127.0.0.1:7003".parse().unwrap()),
+        ]);
+
+        let transport = NodeTransport::from_cluster_config(&config, NodeId::new(1))
+            .expect("node 1 should exist");
+
+        assert_eq!(transport.address(), "127.0.0.1:7001".parse().unwrap());
+        assert_eq!(transport.peer_count(), 2);
+        assert_eq!(
+            transport.peer_address(NodeId::new(2)),
+            Some("127.0.0.1:7002".parse().unwrap())
+        );
+        assert_eq!(
+            transport.peer_address(NodeId::new(3)),
+            Some("127.0.0.1:7003".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn from_cluster_config_returns_none_for_unknown_node() {
+        let config = crate::config::ClusterConfig::new(vec![
+            crate::config::NodeConfig::new(NodeId::new(1), "127.0.0.1:7001".parse().unwrap()),
+            crate::config::NodeConfig::new(NodeId::new(2), "127.0.0.1:7002".parse().unwrap()),
+        ]);
+
+        let transport = NodeTransport::from_cluster_config(&config, NodeId::new(99));
+
+        assert!(transport.is_none());
     }
 }
