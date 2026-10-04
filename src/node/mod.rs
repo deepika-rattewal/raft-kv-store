@@ -1,7 +1,10 @@
 use crate::config::RuntimeConfig;
 use crate::network::server::NetworkServer;
 use crate::network::transport::NodeTransport;
+use crate::raft::election::state::ElectionState;
 use crate::raft::node::RaftNode;
+use crate::raft::replication::ReplicationState;
+use crate::raft::types::LogIndex;
 
 #[derive(Debug)]
 pub struct NodeRuntime {
@@ -74,6 +77,22 @@ impl NodeRuntime {
             .map(NetworkServer::local_addr)
             .transpose()
     }
+
+    pub async fn process_one_message(
+        &mut self,
+        replicated_index: LogIndex,
+        election: &mut ElectionState,
+        replication: &mut ReplicationState,
+    ) -> std::io::Result<()> {
+        let server = self
+            .server
+            .as_ref()
+            .expect("network server must be bound before processing messages");
+
+        server
+            .process_one_message(&mut self.raft, replicated_index, election, replication)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +164,56 @@ mod tests {
 
         assert!(runtime.server().is_some());
         assert!(runtime.server_address().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn processes_one_incoming_raft_message() {
+        use crate::network::client::NetworkClient;
+        use crate::network::message::{NetworkEnvelope, NetworkMessage};
+        use crate::raft::election::state::ElectionState;
+        use crate::raft::replication::ReplicationState;
+        use crate::raft::rpc::RequestVote;
+        use crate::raft::types::{LogIndex, NodeId, Term};
+        use std::time::Duration;
+
+        let mut config = test_config();
+
+        config = RuntimeConfig::new(
+            NodeConfig::new(NodeId::new(1), "127.0.0.1:0".parse::<SocketAddr>().unwrap()),
+            config.cluster().clone(),
+        );
+
+        let mut runtime = NodeRuntime::bind(config).await.unwrap();
+
+        let address = runtime.server_address().unwrap().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut client = NetworkClient::connect(address).await.unwrap();
+
+            let request = RequestVote::for_empty_log(Term::new(1), NodeId::new(2));
+
+            let envelope =
+                NetworkEnvelope::new(NodeId::new(2), NetworkMessage::RequestVote(request));
+
+            client.send_envelope(&envelope).await.unwrap();
+
+            let response = client.receive_envelope().await.unwrap();
+
+            assert_eq!(response.sender(), NodeId::new(1));
+            assert!(matches!(
+                response.message(),
+                NetworkMessage::RequestVoteResponse(_)
+            ));
+        });
+
+        let mut election = ElectionState::new(2, Duration::from_millis(150));
+        let mut replication = ReplicationState::new();
+
+        runtime
+            .process_one_message(LogIndex::new(0), &mut election, &mut replication)
+            .await
+            .unwrap();
+
+        client.await.unwrap();
     }
 }
