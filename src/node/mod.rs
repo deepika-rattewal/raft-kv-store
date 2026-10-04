@@ -1,4 +1,5 @@
 use crate::config::RuntimeConfig;
+use crate::network::server::NetworkServer;
 use crate::network::transport::NodeTransport;
 use crate::raft::node::RaftNode;
 
@@ -7,6 +8,7 @@ pub struct NodeRuntime {
     config: RuntimeConfig,
     raft: RaftNode,
     transport: NodeTransport,
+    server: Option<NetworkServer>,
 }
 
 impl NodeRuntime {
@@ -21,7 +23,25 @@ impl NodeRuntime {
             config,
             raft,
             transport,
+            server: None,
         }
+    }
+
+    pub async fn bind(config: RuntimeConfig) -> std::io::Result<Self> {
+        let node_id = config.node_id();
+        let raft = RaftNode::new(node_id);
+
+        let transport = NodeTransport::from_cluster_config(config.cluster(), node_id)
+            .expect("local node must exist in cluster configuration");
+
+        let server = NetworkServer::bind(config.node().address()).await?;
+
+        Ok(Self {
+            config,
+            raft,
+            transport,
+            server: Some(server),
+        })
     }
 
     pub const fn config(&self) -> &RuntimeConfig {
@@ -40,8 +60,19 @@ impl NodeRuntime {
         &self.transport
     }
 
-    pub const fn transport_mut(&mut self) -> &mut NodeTransport {
+    pub fn transport_mut(&mut self) -> &mut NodeTransport {
         &mut self.transport
+    }
+
+    pub const fn server(&self) -> Option<&NetworkServer> {
+        self.server.as_ref()
+    }
+
+    pub fn server_address(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
+        self.server
+            .as_ref()
+            .map(NetworkServer::local_addr)
+            .transpose()
     }
 }
 
@@ -74,6 +105,7 @@ mod tests {
         let runtime = NodeRuntime::new(config.clone());
 
         assert_eq!(runtime.config(), &config);
+        assert!(runtime.server().is_none());
     }
 
     #[test]
@@ -104,5 +136,14 @@ mod tests {
             runtime.transport().peer_address(NodeId::new(2)),
             Some("127.0.0.1:7002".parse().unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn bind_creates_network_server() {
+        let config = test_config();
+        let runtime = NodeRuntime::bind(config).await.unwrap();
+
+        assert!(runtime.server().is_some());
+        assert!(runtime.server_address().unwrap().is_some());
     }
 }
