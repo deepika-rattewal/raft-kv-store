@@ -1,6 +1,7 @@
 pub mod config;
 pub mod kv;
 pub mod network;
+pub mod node;
 pub mod raft;
 
 pub use kv::{KvCommand, KvStateMachine, KvStore};
