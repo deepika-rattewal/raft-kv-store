@@ -93,6 +93,21 @@ impl NodeRuntime {
             .process_one_message(&mut self.raft, replicated_index, election, replication)
             .await
     }
+
+    pub async fn process_messages(
+        &mut self,
+        message_count: usize,
+        replicated_index: LogIndex,
+        election: &mut ElectionState,
+        replication: &mut ReplicationState,
+    ) -> std::io::Result<()> {
+        for _ in 0..message_count {
+            self.process_one_message(replicated_index, election, replication)
+                .await?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -215,5 +230,81 @@ mod tests {
             .unwrap();
 
         client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn processes_multiple_incoming_raft_messages() {
+        use crate::network::client::NetworkClient;
+        use crate::network::message::{NetworkEnvelope, NetworkMessage};
+        use crate::raft::election::state::ElectionState;
+        use crate::raft::replication::ReplicationState;
+        use crate::raft::rpc::RequestVote;
+        use crate::raft::types::{LogIndex, NodeId, Term};
+        use std::time::Duration;
+
+        let node = NodeConfig::new(NodeId::new(1), "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+
+        let peer = NodeConfig::new(
+            NodeId::new(2),
+            "127.0.0.1:7002".parse::<SocketAddr>().unwrap(),
+        );
+
+        let cluster = ClusterConfig::new(vec![node.clone(), peer]);
+        let config = RuntimeConfig::new(node, cluster);
+
+        let mut runtime = NodeRuntime::bind(config).await.unwrap();
+
+        let address = runtime.server_address().unwrap().unwrap();
+
+        let client_one = tokio::spawn(async move {
+            let mut client = NetworkClient::connect(address).await.unwrap();
+
+            let request = RequestVote::for_empty_log(Term::new(1), NodeId::new(2));
+
+            let envelope =
+                NetworkEnvelope::new(NodeId::new(2), NetworkMessage::RequestVote(request));
+
+            client.send_envelope(&envelope).await.unwrap();
+
+            let response = client.receive_envelope().await.unwrap();
+
+            assert_eq!(response.sender(), NodeId::new(1));
+            assert!(matches!(
+                response.message(),
+                NetworkMessage::RequestVoteResponse(_)
+            ));
+        });
+
+        let address = runtime.server_address().unwrap().unwrap();
+
+        let client_two = tokio::spawn(async move {
+            let mut client = NetworkClient::connect(address).await.unwrap();
+
+            let request = RequestVote::for_empty_log(Term::new(1), NodeId::new(2));
+
+            let envelope =
+                NetworkEnvelope::new(NodeId::new(2), NetworkMessage::RequestVote(request));
+
+            client.send_envelope(&envelope).await.unwrap();
+
+            let response = client.receive_envelope().await.unwrap();
+
+            assert_eq!(response.sender(), NodeId::new(1));
+            assert!(matches!(
+                response.message(),
+                NetworkMessage::RequestVoteResponse(_)
+            ));
+        });
+
+        let mut election = ElectionState::new(2, Duration::from_millis(150));
+        let mut replication = ReplicationState::new();
+
+        runtime
+            .process_messages(2, LogIndex::new(0), &mut election, &mut replication)
+            .await
+            .unwrap();
+
+        client_one.await.unwrap();
+        client_two.await.unwrap();
     }
 }
