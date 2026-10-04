@@ -40,6 +40,16 @@ impl RuntimeConfig {
         let contents = std::fs::read_to_string(path)?;
         Ok(Self::from_toml(&contents)?)
     }
+
+    pub fn validate(&self) -> Result<(), crate::config::ConfigError> {
+        self.cluster.validate()?;
+
+        if !self.cluster.contains_node(self.node_id()) {
+            return Err(crate::config::ConfigError::NodeNotInCluster(self.node_id()));
+        }
+
+        Ok(())
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -88,8 +98,8 @@ mod tests {
     }
 
     #[test]
-fn loads_from_toml() {
-    let toml = r#"
+    fn loads_from_toml() {
+        let toml = r#"
 [node]
 node_id = 1
 address = "127.0.0.1:7001"
@@ -105,18 +115,18 @@ node_id = 2
 address = "127.0.0.1:7002"
 "#;
 
-    let config = RuntimeConfig::from_toml(toml)
-        .expect("runtime configuration should load from TOML");
+        let config =
+            RuntimeConfig::from_toml(toml).expect("runtime configuration should load from TOML");
 
-    assert_eq!(config.node_id(), NodeId::new(1));
-    assert_eq!(config.node().address(), "127.0.0.1:7001".parse().unwrap());
-    assert_eq!(config.cluster().node_count(), 2);
-    assert_eq!(config.peer_nodes().len(), 1);
-}
+        assert_eq!(config.node_id(), NodeId::new(1));
+        assert_eq!(config.node().address(), "127.0.0.1:7001".parse().unwrap());
+        assert_eq!(config.cluster().node_count(), 2);
+        assert_eq!(config.peer_nodes().len(), 1);
+    }
 
-#[test]
-fn loads_from_file() {
-    let toml = r#"
+    #[test]
+    fn loads_from_file() {
+        let toml = r#"
 [node]
 node_id = 1
 address = "127.0.0.1:7001"
@@ -132,16 +142,35 @@ node_id = 2
 address = "127.0.0.1:7002"
 "#;
 
-    let path = std::env::temp_dir().join("raft_kv_runtime_config_test.toml");
+        let path = std::env::temp_dir().join("raft_kv_runtime_config_test.toml");
 
-    std::fs::write(&path, toml).expect("test configuration should be written");
+        std::fs::write(&path, toml).expect("test configuration should be written");
 
-    let config = RuntimeConfig::load_from_file(&path)
-        .expect("runtime configuration should load from file");
+        let config = RuntimeConfig::load_from_file(&path)
+            .expect("runtime configuration should load from file");
 
-    assert_eq!(config.node_id(), NodeId::new(1));
-    assert_eq!(config.cluster().node_count(), 2);
+        assert_eq!(config.node_id(), NodeId::new(1));
+        assert_eq!(config.cluster().node_count(), 2);
 
-    std::fs::remove_file(&path).expect("test configuration should be removed");
-}
+        std::fs::remove_file(&path).expect("test configuration should be removed");
+    }
+
+    #[test]
+    fn rejects_local_node_not_in_cluster() {
+        let local_node = NodeConfig::new(NodeId::new(99), "127.0.0.1:7099".parse().unwrap());
+
+        let cluster = ClusterConfig::new(vec![
+            NodeConfig::new(NodeId::new(1), "127.0.0.1:7001".parse().unwrap()),
+            NodeConfig::new(NodeId::new(2), "127.0.0.1:7002".parse().unwrap()),
+        ]);
+
+        let config = RuntimeConfig::new(local_node, cluster);
+
+        assert_eq!(
+            config.validate(),
+            Err(crate::config::ConfigError::NodeNotInCluster(NodeId::new(
+                99
+            )))
+        );
+    }
 }

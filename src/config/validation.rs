@@ -10,6 +10,7 @@ pub enum ConfigError {
     DuplicateAddress,
     InvalidPort,
     UnspecifiedAddress,
+    NodeNotInCluster(NodeId),
 }
 
 impl fmt::Display for ConfigError {
@@ -23,6 +24,9 @@ impl fmt::Display for ConfigError {
             Self::InvalidPort => write!(f, "node address must use a non-zero port"),
             Self::UnspecifiedAddress => {
                 write!(f, "node address must not be an unspecified address")
+            }
+            Self::NodeNotInCluster(node_id) => {
+                write!(f, "local node is not present in cluster: {node_id:?}")
             }
         }
     }
