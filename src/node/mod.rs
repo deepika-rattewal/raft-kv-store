@@ -1,10 +1,12 @@
 use crate::config::RuntimeConfig;
+use crate::network::transport::NodeTransport;
 use crate::raft::node::RaftNode;
 
 #[derive(Debug)]
 pub struct NodeRuntime {
     config: RuntimeConfig,
     raft: RaftNode,
+    transport: NodeTransport,
 }
 
 impl NodeRuntime {
@@ -12,7 +14,14 @@ impl NodeRuntime {
         let node_id = config.node_id();
         let raft = RaftNode::new(node_id);
 
-        Self { config, raft }
+        let transport = NodeTransport::from_cluster_config(config.cluster(), node_id)
+            .expect("local node must exist in cluster configuration");
+
+        Self {
+            config,
+            raft,
+            transport,
+        }
     }
 
     pub const fn config(&self) -> &RuntimeConfig {
@@ -25,6 +34,14 @@ impl NodeRuntime {
 
     pub fn raft_mut(&mut self) -> &mut RaftNode {
         &mut self.raft
+    }
+
+    pub const fn transport(&self) -> &NodeTransport {
+        &self.transport
+    }
+
+    pub const fn transport_mut(&mut self) -> &mut NodeTransport {
+        &mut self.transport
     }
 }
 
@@ -75,5 +92,17 @@ mod tests {
         runtime.raft_mut().start_election();
 
         assert!(runtime.raft().role().is_candidate());
+    }
+
+    #[test]
+    fn creates_transport_with_cluster_peers() {
+        let config = test_config();
+        let runtime = NodeRuntime::new(config);
+
+        assert_eq!(runtime.transport().peer_count(), 1);
+        assert_eq!(
+            runtime.transport().peer_address(NodeId::new(2)),
+            Some("127.0.0.1:7002".parse().unwrap())
+        );
     }
 }
