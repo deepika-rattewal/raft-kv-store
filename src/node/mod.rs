@@ -176,9 +176,28 @@ impl NodeRuntime {
             .as_ref()
             .expect("network server must be bound before processing messages");
 
-        server
-            .process_one_message(&mut self.raft, replicated_index, election, replication)
-            .await
+        let mut connection = server.receive_one_message().await?;
+
+        let envelope = connection.receive_envelope().await?;
+
+        let is_heartbeat = matches!(
+            envelope.message(),
+            crate::network::message::NetworkMessage::AppendEntries(request)
+                if request.is_heartbeat()
+        );
+
+        if is_heartbeat {
+            self.reset_timer();
+        }
+
+        if let Some(response) =
+            self.raft
+                .handle_network_envelope(envelope, replicated_index, election, replication)
+        {
+            connection.send_envelope(&response).await?;
+        }
+
+        Ok(())
     }
 
     pub async fn process_messages(
@@ -600,95 +619,135 @@ mod tests {
     }
 
     #[tokio::test]
-async fn leader_sends_heartbeat_to_peer() {
-    use crate::network::client::NetworkClient;
-    use crate::network::message::NetworkMessage;
-    use crate::raft::types::{NodeId, Term};
-    use std::net::SocketAddr;
+    async fn leader_sends_heartbeat_to_peer() {
+        use crate::network::client::NetworkClient;
+        use crate::network::message::NetworkMessage;
+        use crate::raft::types::{NodeId, Term};
+        use std::net::SocketAddr;
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 
-    let peer_address = listener.local_addr().unwrap();
+        let peer_address = listener.local_addr().unwrap();
 
-    let node = NodeConfig::new(
-        NodeId::new(1),
-        "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-    );
+        let node = NodeConfig::new(NodeId::new(1), "127.0.0.1:0".parse::<SocketAddr>().unwrap());
 
-    let peer = NodeConfig::new(
-        NodeId::new(2),
-        peer_address,
-    );
+        let peer = NodeConfig::new(NodeId::new(2), peer_address);
 
-    let cluster = ClusterConfig::new(vec![
-        node.clone(),
-        peer,
-    ]);
+        let cluster = ClusterConfig::new(vec![node.clone(), peer]);
 
-    let config = RuntimeConfig::new(node, cluster);
+        let config = RuntimeConfig::new(node, cluster);
 
-    let mut runtime = NodeRuntime::new(config);
+        let mut runtime = NodeRuntime::new(config);
 
-    runtime.advance_timer(
-        std::time::Duration::from_millis(100),
-    );
+        runtime.advance_timer(std::time::Duration::from_millis(100));
 
-    runtime.raft_mut().start_election();
+        runtime.raft_mut().start_election();
 
-runtime.raft_mut().become_leader();
+        runtime.raft_mut().become_leader();
 
-    let receiver = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
+        let receiver = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
 
-        let mut client =
-            NetworkClient::from_stream(stream);
+            let mut client = NetworkClient::from_stream(stream);
 
-        let envelope =
-            client.receive_envelope().await.unwrap();
+            let envelope = client.receive_envelope().await.unwrap();
 
-        assert_eq!(
-            envelope.sender(),
-            NodeId::new(1)
-        );
+            assert_eq!(envelope.sender(), NodeId::new(1));
 
-        match envelope.message() {
-            NetworkMessage::AppendEntries(request) => {
-                assert_eq!(
-                    request.term,
-                    Term::new(1)
-                );
+            match envelope.message() {
+                NetworkMessage::AppendEntries(request) => {
+                    assert_eq!(request.term, Term::new(1));
 
-                assert_eq!(
-                    request.leader_id,
-                    NodeId::new(1)
-                );
+                    assert_eq!(request.leader_id, NodeId::new(1));
 
-                assert!(
-                    request.is_heartbeat()
-                );
+                    assert!(request.is_heartbeat());
 
-                assert_eq!(
-                    request.entry_count(),
-                    0
-                );
+                    assert_eq!(request.entry_count(), 0);
+                }
+
+                other => {
+                    panic!("expected AppendEntries heartbeat, got {other:?}");
+                }
             }
 
-            other => {
-                panic!(
-                    "expected AppendEntries heartbeat, got {other:?}"
-                );
+            client.shutdown().await.unwrap();
+        });
+
+        runtime.tick().await.unwrap();
+
+        receiver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn follower_resets_election_timer_when_heartbeat_is_received() {
+        use crate::network::client::NetworkClient;
+        use crate::network::message::{NetworkEnvelope, NetworkMessage};
+        use crate::raft::election::state::ElectionState;
+        use crate::raft::replication::ReplicationState;
+        use crate::raft::rpc::AppendEntries;
+        use crate::raft::types::{LogIndex, NodeId, Term};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let node = NodeConfig::new(NodeId::new(2), "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+
+        let peer = NodeConfig::new(NodeId::new(1), "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+
+        let cluster = ClusterConfig::new(vec![node.clone(), peer]);
+
+        let config = RuntimeConfig::new(node, cluster);
+
+        let mut runtime = NodeRuntime::bind(config).await.unwrap();
+
+        runtime.advance_timer(Duration::from_millis(90));
+
+        assert_eq!(runtime.timer().elapsed(), Duration::from_millis(90));
+
+        let server_address = runtime.server().unwrap().local_addr().unwrap();
+
+        let sender = tokio::spawn(async move {
+            let mut client = NetworkClient::connect(server_address).await.unwrap();
+
+            let heartbeat = AppendEntries::heartbeat(
+                Term::new(1),
+                NodeId::new(1),
+                None,
+                None,
+                Some(LogIndex::new(0)),
+            );
+
+            let envelope =
+                NetworkEnvelope::new(NodeId::new(1), NetworkMessage::AppendEntries(heartbeat));
+
+            client.send_envelope(&envelope).await.unwrap();
+
+            let response = client.receive_envelope().await.unwrap();
+
+            assert_eq!(response.sender(), NodeId::new(2));
+
+            match response.message() {
+                NetworkMessage::AppendEntriesResponse(response) => {
+                    assert_eq!(response.term(), Term::new(1));
+                }
+                other => panic!("expected AppendEntriesResponse, got {other:?}"),
             }
-        }
 
-        client.shutdown().await.unwrap();
-    });
+            client.shutdown().await.unwrap();
+        });
 
-    runtime.tick().await.unwrap();
+        let mut election = ElectionState::new(2, Duration::from_millis(500));
 
-    receiver.await.unwrap();
-}
+        let mut replication = ReplicationState::new();
+
+        runtime
+            .process_one_message(LogIndex::new(0), &mut election, &mut replication)
+            .await
+            .unwrap();
+
+        sender.await.unwrap();
+
+        assert_eq!(runtime.timer().elapsed(), Duration::ZERO);
+    }
 
     #[tokio::test]
     async fn peer_sends_request_vote_response_over_tcp() {

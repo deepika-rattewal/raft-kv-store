@@ -43,6 +43,10 @@ impl NetworkServer {
         self.accept().await
     }
 
+    pub async fn receive_one_message(&self) -> std::io::Result<NetworkConnection> {
+        self.accept_and_receive().await
+    }
+
     pub async fn process_one_message(
         &self,
         node: &mut RaftNode,
