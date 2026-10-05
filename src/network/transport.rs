@@ -91,6 +91,33 @@ impl NodeTransport {
         self.send_to_peer(peer, &envelope).await
     }
 
+    pub async fn request_vote(
+        &self,
+        peer: NodeId,
+        sender: NodeId,
+        request: crate::raft::rpc::RequestVote,
+    ) -> io::Result<crate::raft::rpc::RequestVoteResponse> {
+        let address = self
+            .peer_address(peer)
+            .ok_or_else(|| io::Error::from(TransportError::UnknownPeer(peer)))?;
+
+        let mut client = NetworkClient::connect(address).await?;
+
+        let envelope = NetworkEnvelope::new(sender, request.into());
+
+        client.send_envelope(&envelope).await?;
+
+        let response = client.receive_envelope().await?;
+
+        match response.message() {
+            crate::network::message::NetworkMessage::RequestVoteResponse(response) => Ok(*response),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected RequestVoteResponse",
+            )),
+        }
+    }
+
     pub async fn send_append_entries(
         &self,
         peer: NodeId,
@@ -210,6 +237,51 @@ mod tests {
 
         assert_eq!(received.sender(), NodeId::new(1));
         assert_eq!(received.message(), &NetworkMessage::RequestVote(request));
+    }
+
+    #[tokio::test]
+    async fn transport_can_request_vote_and_receive_response() {
+        let server = NetworkServer::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+
+        let address = server.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let mut connection = server.accept().await.unwrap();
+
+            let received = connection.receive_envelope().await.unwrap();
+
+            match received.message() {
+                NetworkMessage::RequestVote(request) => {
+                    assert_eq!(request.term, Term::new(1));
+                    assert_eq!(request.candidate_id, NodeId::new(1));
+                }
+                other => panic!("expected RequestVote, got {other:?}"),
+            }
+
+            let response = crate::raft::rpc::RequestVoteResponse::granted(Term::new(1));
+
+            let response_envelope = NetworkEnvelope::new(NodeId::new(2), response.into());
+
+            connection.send_envelope(&response_envelope).await.unwrap();
+        });
+
+        let mut transport = NodeTransport::new("127.0.0.1:9000".parse().unwrap());
+
+        transport.add_peer(NodeId::new(2), address);
+
+        let request = RequestVote::for_empty_log(Term::new(1), NodeId::new(1));
+
+        let response = transport
+            .request_vote(NodeId::new(2), NodeId::new(1), request)
+            .await
+            .unwrap();
+
+        assert_eq!(response.term(), Term::new(1));
+        assert!(response.vote_granted());
+
+        server_task.await.unwrap();
     }
 
     #[tokio::test]

@@ -55,6 +55,12 @@ impl NetworkClient {
     pub async fn shutdown(&mut self) -> io::Result<()> {
         self.connection.shutdown().await
     }
+
+    pub fn from_stream(stream: tokio::net::TcpStream) -> Self {
+        Self {
+            connection: TcpConnection::new(stream),
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
