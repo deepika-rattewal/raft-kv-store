@@ -296,7 +296,9 @@ impl RaftNode {
             .prev_log_index
             .map(|index| LogIndex::new(index.value().saturating_sub(1)));
 
-        self.log.replace_suffix(replace_index, &request.entries);
+        if !request.entries.is_empty() {
+            self.log.replace_suffix(replace_index, &request.entries);
+        }
 
         self.update_commit_index(request.leader_commit);
         self.apply_committed_entries();
@@ -1240,6 +1242,34 @@ mod tests {
         assert!(node.handle_append_entries(heartbeat).is_success());
         assert_eq!(node.commit_index(), Some(LogIndex::new(2)));
     }
+
+    #[test]
+    fn heartbeat_does_not_delete_entries_after_previous_log_index() {
+        let mut node = RaftNode::new(NodeId::new(1));
+
+        node.append_log_entry(LogEntry::new(Term::new(1), KvCommand::put("a", "1")));
+
+        node.append_log_entry(LogEntry::new(Term::new(1), KvCommand::put("b", "2")));
+
+        node.append_log_entry(LogEntry::new(Term::new(1), KvCommand::put("c", "3")));
+
+        let heartbeat = AppendEntries::heartbeat(
+            Term::new(1),
+            NodeId::new(2),
+            Some(LogIndex::new(2)),
+            Some(Term::new(1)),
+            Some(LogIndex::new(2)),
+        );
+
+        let response = node.handle_append_entries(heartbeat);
+
+        assert!(response.is_success());
+        assert_eq!(node.log().len(), 3);
+        assert_eq!(node.log().term_at(LogIndex::new(0)), Some(Term::new(1)));
+        assert_eq!(node.log().term_at(LogIndex::new(1)), Some(Term::new(1)));
+        assert_eq!(node.log().term_at(LogIndex::new(2)), Some(Term::new(1)));
+    }
+
     #[test]
     fn build_append_entries_uses_replication_state() {
         let mut node = RaftNode::new(NodeId::new(1));
