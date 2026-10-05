@@ -676,6 +676,8 @@ mod tests {
         runtime.tick().await.unwrap();
 
         receiver.await.unwrap();
+
+        assert_eq!(runtime.timer().elapsed(), std::time::Duration::ZERO);
     }
 
     #[tokio::test]
