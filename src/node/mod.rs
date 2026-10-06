@@ -204,13 +204,17 @@ impl NodeRuntime {
             .expect("network server must be bound before processing messages");
 
         let mut connection = server.receive_one_message().await?;
-
         let envelope = connection.receive_envelope().await?;
 
         let is_heartbeat = matches!(
             envelope.message(),
             crate::network::message::NetworkMessage::AppendEntries(request)
                 if request.is_heartbeat()
+        );
+
+        let is_append_entries_response = matches!(
+            envelope.message(),
+            crate::network::message::NetworkMessage::AppendEntriesResponse(_)
         );
 
         if is_heartbeat {
@@ -224,6 +228,13 @@ impl NodeRuntime {
             &mut self.replication,
         ) {
             connection.send_envelope(&response).await?;
+        }
+
+        if is_append_entries_response {
+            let cluster_size = self.config.cluster().node_count();
+
+            self.raft
+                .advance_and_apply_committed_entries(&self.replication, cluster_size);
         }
 
         Ok(())
@@ -1078,10 +1089,8 @@ mod tests {
 
         let response = crate::raft::rpc::AppendEntriesResponse::success(Term::new(1));
 
-        let network_response = NetworkEnvelope::new(
-            peer,
-            NetworkMessage::AppendEntriesResponse(response.clone()),
-        );
+        let network_response =
+            NetworkEnvelope::new(peer, NetworkMessage::AppendEntriesResponse(response));
 
         let receiver = tokio::spawn(async move {
             let mut client = NetworkClient::connect(leader_address).await.unwrap();
@@ -1107,6 +1116,151 @@ mod tests {
         assert_eq!(
             runtime.replication().next_index(peer),
             Some(LogIndex::new(2))
+        );
+    }
+
+    #[test]
+    fn runtime_commits_replicated_entry_after_majority_acknowledgement() {
+        use crate::kv::command::KvCommand;
+        use crate::raft::log::LogEntry;
+        use crate::raft::rpc::AppendEntriesResponse;
+        use crate::raft::types::{LogIndex, NodeId, Term};
+        use std::net::SocketAddr;
+
+        let leader = NodeConfig::new(
+            NodeId::new(1),
+            "127.0.0.1:7001".parse::<SocketAddr>().unwrap(),
+        );
+
+        let follower = NodeConfig::new(
+            NodeId::new(2),
+            "127.0.0.1:7002".parse::<SocketAddr>().unwrap(),
+        );
+
+        let cluster = ClusterConfig::new(vec![leader.clone(), follower]);
+
+        let config = RuntimeConfig::new(leader, cluster);
+
+        let mut runtime = NodeRuntime::new(config);
+
+        runtime.raft_mut().start_election();
+        runtime.raft_mut().become_leader();
+
+        runtime
+            .raft_mut()
+            .append_log_entry(LogEntry::new(Term::new(1), KvCommand::put("name", "raft")));
+
+        let peer = NodeId::new(2);
+        let replicated_index = LogIndex::new(1);
+
+        let response = AppendEntriesResponse::success(Term::new(1));
+
+        let (raft, replication) = (&mut runtime.raft, &mut runtime.replication);
+
+        raft.handle_append_entries_response_message(peer, replicated_index, response, replication);
+        assert_eq!(
+            runtime.replication().match_index(peer),
+            Some(LogIndex::new(1))
+        );
+
+        let committed = {
+            let (raft, replication) = (&mut runtime.raft, &runtime.replication);
+
+            raft.advance_commit_index(replication, 2)
+        };
+
+        assert_eq!(committed, Some(LogIndex::new(1)));
+        assert_eq!(runtime.raft().commit_index(), Some(LogIndex::new(1)));
+
+        runtime.raft_mut().apply_committed_entries();
+
+        assert_eq!(runtime.raft().last_applied(), Some(LogIndex::new(1)));
+
+        assert_eq!(
+            runtime.raft().state_machine().get("name"),
+            Some("raft".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_commits_entry_after_tcp_replication_response() {
+        use crate::config::cluster_config::ClusterConfig;
+        use crate::config::node_config::NodeConfig;
+        use crate::config::runtime_config::RuntimeConfig;
+        use crate::kv::command::KvCommand;
+        use crate::network::client::NetworkClient;
+        use crate::network::message::{NetworkEnvelope, NetworkMessage};
+        use crate::raft::log::LogEntry;
+        use crate::raft::rpc::AppendEntriesResponse;
+        use crate::raft::types::{LogIndex, NodeId, Term};
+        use std::net::SocketAddr;
+
+        let leader = NodeConfig::new(NodeId::new(1), "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+
+        let follower =
+            NodeConfig::new(NodeId::new(2), "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+
+        let cluster = ClusterConfig::new(vec![leader.clone(), follower.clone()]);
+        let config = RuntimeConfig::new(leader, cluster);
+
+        let mut runtime = NodeRuntime::bind(config).await.unwrap();
+
+        runtime.raft_mut().start_election();
+        runtime.raft_mut().become_leader();
+
+        runtime
+            .raft_mut()
+            .append_log_entry(LogEntry::new(Term::new(1), KvCommand::put("name", "raft")));
+
+        let leader_address = runtime.server_address().unwrap().unwrap();
+
+        let peer = NodeId::new(2);
+
+        let response = AppendEntriesResponse::success(Term::new(1));
+
+        let envelope = NetworkEnvelope::new(peer, NetworkMessage::AppendEntriesResponse(response));
+
+        let sender = tokio::spawn(async move {
+            let mut client = NetworkClient::connect(leader_address).await.unwrap();
+
+            client.send_envelope(&envelope).await.unwrap();
+
+            client.shutdown().await.unwrap();
+        });
+
+        let mut election = crate::raft::election::state::ElectionState::new(
+            2,
+            std::time::Duration::from_millis(500),
+        );
+
+        let mut replication = crate::raft::replication::ReplicationState::new();
+
+        replication.add_peer(peer, LogIndex::new(1));
+
+        runtime
+            .process_one_message(LogIndex::new(1), &mut election, &mut replication)
+            .await
+            .unwrap();
+
+        sender.await.unwrap();
+
+        assert_eq!(
+            runtime.replication().match_index(peer),
+            Some(LogIndex::new(1))
+        );
+
+        assert_eq!(
+            runtime.replication().next_index(peer),
+            Some(LogIndex::new(2))
+        );
+
+        assert_eq!(runtime.raft().commit_index(), Some(LogIndex::new(1)));
+
+        assert_eq!(runtime.raft().last_applied(), Some(LogIndex::new(1)));
+
+        assert_eq!(
+            runtime.raft().state_machine().get("name"),
+            Some("raft".to_string())
         );
     }
 }
