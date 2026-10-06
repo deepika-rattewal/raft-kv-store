@@ -17,6 +17,7 @@ pub struct NodeRuntime {
     server: Option<NetworkServer>,
     timer: NodeTimer,
     election: ElectionState,
+    replication: ReplicationState,
 }
 
 impl NodeRuntime {
@@ -29,12 +30,21 @@ impl NodeRuntime {
             .expect("local node must exist in cluster configuration");
 
         Self {
-            config,
             raft,
             transport,
             server: None,
             timer: NodeTimer::new(std::time::Duration::from_millis(100)),
             election: ElectionState::new(cluster_size, std::time::Duration::from_millis(500)),
+            replication: {
+                let mut replication = ReplicationState::new();
+
+                for peer in config.peer_nodes() {
+                    replication.add_peer(peer.node_id(), LogIndex::new(1));
+                }
+
+                replication
+            },
+            config,
         }
     }
 
@@ -49,12 +59,21 @@ impl NodeRuntime {
         let server = NetworkServer::bind(config.node().address()).await?;
 
         Ok(Self {
-            config,
             raft,
             transport,
             server: Some(server),
             timer: NodeTimer::new(std::time::Duration::from_millis(100)),
             election: ElectionState::new(cluster_size, std::time::Duration::from_millis(500)),
+            replication: {
+                let mut replication = ReplicationState::new();
+
+                for peer in config.peer_nodes() {
+                    replication.add_peer(peer.node_id(), LogIndex::new(1));
+                }
+
+                replication
+            },
+            config,
         })
     }
 
@@ -83,8 +102,6 @@ impl NodeRuntime {
         }
 
         if self.raft.role().is_leader() {
-            let heartbeat = self.raft.build_heartbeat();
-
             let peers: Vec<_> = self
                 .config
                 .peer_nodes()
@@ -93,9 +110,11 @@ impl NodeRuntime {
                 .collect();
 
             for peer in peers {
-                self.transport
-                    .send_append_entries(peer, self.raft.id(), heartbeat.clone())
-                    .await?;
+                if let Some(request) = self.raft.build_append_entries(peer, &self.replication) {
+                    self.transport
+                        .send_append_entries(peer, self.raft.id(), request)
+                        .await?;
+                }
             }
 
             return Ok(());
@@ -152,6 +171,14 @@ impl NodeRuntime {
 
     pub fn transport_mut(&mut self) -> &mut NodeTransport {
         &mut self.transport
+    }
+
+    pub const fn replication(&self) -> &ReplicationState {
+        &self.replication
+    }
+
+    pub fn replication_mut(&mut self) -> &mut ReplicationState {
+        &mut self.replication
     }
 
     pub const fn server(&self) -> Option<&NetworkServer> {
@@ -678,6 +705,174 @@ mod tests {
         receiver.await.unwrap();
 
         assert_eq!(runtime.timer().elapsed(), std::time::Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn leader_sends_log_entry_to_peer() {
+        use crate::kv::command::KvCommand;
+        use crate::network::client::NetworkClient;
+        use crate::network::message::NetworkMessage;
+        use crate::raft::log::LogEntry;
+        use crate::raft::types::{NodeId, Term};
+        use std::net::SocketAddr;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let peer_address = listener.local_addr().unwrap();
+
+        let node = NodeConfig::new(NodeId::new(1), "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+
+        let peer = NodeConfig::new(NodeId::new(2), peer_address);
+
+        let cluster = ClusterConfig::new(vec![node.clone(), peer]);
+
+        let config = RuntimeConfig::new(node, cluster);
+
+        let mut runtime = NodeRuntime::new(config);
+
+        runtime.advance_timer(std::time::Duration::from_millis(100));
+
+        runtime.raft_mut().start_election();
+        runtime.raft_mut().become_leader();
+
+        runtime
+            .raft_mut()
+            .append_log_entry(LogEntry::new(Term::new(1), KvCommand::put("name", "raft")));
+
+        let receiver = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+
+            let mut client = NetworkClient::from_stream(stream);
+
+            let envelope = client.receive_envelope().await.unwrap();
+
+            assert_eq!(envelope.sender(), NodeId::new(1));
+
+            match envelope.message() {
+                NetworkMessage::AppendEntries(request) => {
+                    assert_eq!(request.term, Term::new(1));
+                    assert_eq!(request.leader_id, NodeId::new(1));
+                    assert!(!request.is_heartbeat());
+                    assert_eq!(request.entry_count(), 1);
+                    assert_eq!(request.entries[0].term(), Term::new(1));
+
+                    match request.entries[0].command() {
+                        KvCommand::Put { key, value } => {
+                            assert_eq!(key, "name");
+                            assert_eq!(value, "raft");
+                        }
+                        other => {
+                            panic!("expected Put command, got {other:?}");
+                        }
+                    }
+                }
+                other => {
+                    panic!("expected AppendEntries, got {other:?}");
+                }
+            }
+
+            client.shutdown().await.unwrap();
+        });
+
+        runtime.tick().await.unwrap();
+
+        receiver.await.unwrap();
+
+        assert_eq!(runtime.timer().elapsed(), std::time::Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn follower_receives_log_entry_and_applies_it_to_state_machine() {
+        use crate::config::{ClusterConfig, NodeConfig, RuntimeConfig};
+        use crate::kv::command::KvCommand;
+        use crate::network::client::NetworkClient;
+        use crate::network::message::NetworkMessage;
+        use crate::raft::election::state::ElectionState;
+        use crate::raft::log::LogEntry;
+        use crate::raft::replication::ReplicationState;
+        use crate::raft::types::{LogIndex, NodeId, Term};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let leader = NodeConfig::new(NodeId::new(1), "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+
+        let follower =
+            NodeConfig::new(NodeId::new(2), "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+
+        let cluster = ClusterConfig::new(vec![leader.clone(), follower.clone()]);
+
+        let follower_config = RuntimeConfig::new(follower, cluster);
+
+        let mut follower_runtime = NodeRuntime::bind(follower_config).await.unwrap();
+
+        let follower_address = follower_runtime.server_address().unwrap().unwrap();
+
+        let mut leader_node = crate::raft::node::RaftNode::new(NodeId::new(1));
+
+        leader_node.start_election();
+        leader_node.become_leader();
+
+        leader_node.append_log_entry(LogEntry::new(Term::new(1), KvCommand::put("name", "raft")));
+
+        let mut replication = ReplicationState::new();
+
+        replication.add_peer(NodeId::new(2), LogIndex::new(1));
+
+        let mut request = leader_node
+            .build_append_entries(NodeId::new(2), &replication)
+            .unwrap();
+
+        request.leader_commit = Some(LogIndex::new(1));
+
+        assert_eq!(request.entry_count(), 1);
+
+        let sender = tokio::spawn(async move {
+            let mut client = NetworkClient::connect(follower_address).await.unwrap();
+
+            let envelope = crate::network::message::NetworkEnvelope::new(
+                NodeId::new(1),
+                NetworkMessage::AppendEntries(request),
+            );
+
+            client.send_envelope(&envelope).await.unwrap();
+
+            let response = client.receive_envelope().await.unwrap();
+
+            match response.message() {
+                NetworkMessage::AppendEntriesResponse(response) => {
+                    assert!(response.is_success());
+                }
+                other => {
+                    panic!("expected AppendEntriesResponse, got {other:?}");
+                }
+            }
+
+            client.shutdown().await.unwrap();
+        });
+
+        let mut election = ElectionState::new(2, Duration::from_millis(500));
+        let mut follower_replication = ReplicationState::new();
+
+        follower_runtime
+            .process_one_message(LogIndex::new(1), &mut election, &mut follower_replication)
+            .await
+            .unwrap();
+
+        sender.await.unwrap();
+
+        assert_eq!(follower_runtime.raft().log().len(), 1);
+        assert_eq!(
+            follower_runtime.raft().commit_index(),
+            Some(LogIndex::new(1))
+        );
+        assert_eq!(
+            follower_runtime.raft().last_applied(),
+            Some(LogIndex::new(1))
+        );
+        assert_eq!(
+            follower_runtime.raft().state_machine().get("name"),
+            Some("raft".to_string())
+        );
     }
 
     #[tokio::test]
