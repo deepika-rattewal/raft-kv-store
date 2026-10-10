@@ -795,6 +795,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leader_retries_append_entries_from_backtracked_index_over_tcp() {
+        use crate::config::cluster_config::ClusterConfig;
+        use crate::config::node_config::NodeConfig;
+        use crate::config::runtime_config::RuntimeConfig;
+        use crate::kv::command::KvCommand;
+        use crate::network::client::NetworkClient;
+        use crate::network::message::NetworkMessage;
+        use crate::raft::log::LogEntry;
+        use crate::raft::types::{LogIndex, NodeId, Term};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_address = listener.local_addr().unwrap();
+
+        let leader = NodeConfig::new(NodeId::new(1), "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+        let follower = NodeConfig::new(NodeId::new(2), peer_address);
+
+        let cluster = ClusterConfig::new(vec![leader.clone(), follower]);
+        let config = RuntimeConfig::new(leader, cluster);
+        let mut runtime = NodeRuntime::bind(config).await.unwrap();
+
+        runtime.advance_timer(Duration::from_millis(100));
+
+        runtime.raft_mut().start_election();
+        runtime.raft_mut().become_leader();
+
+        for value in ["one", "two", "three"] {
+            runtime
+                .raft_mut()
+                .append_log_entry(LogEntry::new(Term::new(1), KvCommand::put("key", value)));
+        }
+
+        let peer = NodeId::new(2);
+
+        // Set next_index to 3, then backtrack once to 2.
+        runtime.replication_mut().add_peer(peer, LogIndex::new(3));
+        runtime.replication_mut().backtrack(peer);
+
+        assert_eq!(
+            runtime.replication().next_index(peer),
+            Some(LogIndex::new(2))
+        );
+
+        let receiver = tokio::spawn(async move {
+            let (stream, _) = timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .expect("leader did not connect to follower")
+                .unwrap();
+
+            let mut client = NetworkClient::from_stream(stream);
+            let envelope = timeout(Duration::from_secs(3), client.receive_envelope())
+                .await
+                .expect("leader did not send an envelope")
+                .unwrap();
+
+            match envelope.message() {
+                NetworkMessage::AppendEntries(request) => {
+                    assert_eq!(request.prev_log_index, Some(LogIndex::new(1)));
+                    assert_eq!(request.entries.len(), 2);
+                    assert_eq!(request.entries[0].command(), &KvCommand::put("key", "two"));
+                    assert_eq!(
+                        request.entries[1].command(),
+                        &KvCommand::put("key", "three")
+                    );
+                }
+                other => panic!("expected AppendEntries, got {other:?}"),
+            }
+
+            client.shutdown().await.unwrap();
+        });
+
+        runtime.tick().await.unwrap();
+        timeout(Duration::from_secs(5), receiver)
+            .await
+            .expect("TCP receiver task timed out")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn follower_receives_log_entry_and_applies_it_to_state_machine() {
         use crate::config::{ClusterConfig, NodeConfig, RuntimeConfig};
         use crate::kv::command::KvCommand;
@@ -1262,5 +1343,236 @@ mod tests {
             runtime.raft().state_machine().get("name"),
             Some("raft".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_backtracks_replication_after_tcp_failure_response() {
+        use crate::config::cluster_config::ClusterConfig;
+        use crate::config::node_config::NodeConfig;
+        use crate::config::runtime_config::RuntimeConfig;
+        use crate::kv::command::KvCommand;
+        use crate::network::client::NetworkClient;
+        use crate::network::message::{NetworkEnvelope, NetworkMessage};
+        use crate::raft::log::LogEntry;
+        use crate::raft::rpc::AppendEntriesResponse;
+        use crate::raft::types::{LogIndex, NodeId, Term};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        let leader = NodeConfig::new(NodeId::new(1), "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+
+        let follower =
+            NodeConfig::new(NodeId::new(2), "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+
+        let cluster = ClusterConfig::new(vec![leader.clone(), follower.clone()]);
+        let config = RuntimeConfig::new(leader, cluster);
+
+        let mut runtime = NodeRuntime::bind(config).await.unwrap();
+
+        runtime.raft_mut().start_election();
+        runtime.raft_mut().become_leader();
+
+        // Create three log entries so the leader has a later index to retry from.
+        for value in ["one", "two", "three"] {
+            runtime
+                .raft_mut()
+                .append_log_entry(LogEntry::new(Term::new(1), KvCommand::put("key", value)));
+        }
+
+        let peer = NodeId::new(2);
+
+        // Simulate the leader having attempted replication from index 3.
+        runtime.replication_mut().add_peer(peer, LogIndex::new(3));
+
+        let leader_address = runtime.server_address().unwrap().unwrap();
+
+        let response = AppendEntriesResponse::failure(Term::new(1));
+        let envelope = NetworkEnvelope::new(peer, NetworkMessage::AppendEntriesResponse(response));
+
+        let sender = tokio::spawn(async move {
+            let mut client = NetworkClient::connect(leader_address).await.unwrap();
+            client.send_envelope(&envelope).await.unwrap();
+            client.shutdown().await.unwrap();
+        });
+
+        let mut election =
+            crate::raft::election::state::ElectionState::new(2, Duration::from_millis(500));
+
+        let mut replication = crate::raft::replication::ReplicationState::new();
+        replication.add_peer(peer, LogIndex::new(3));
+
+        runtime
+            .process_one_message(LogIndex::new(1), &mut election, &mut replication)
+            .await
+            .unwrap();
+
+        sender.await.unwrap();
+
+        // A failure response should move next_index from 3 back to 2.
+        assert_eq!(
+            runtime.replication().next_index(peer),
+            Some(LogIndex::new(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn leader_retries_replication_after_tcp_failure_response() {
+        use crate::kv::command::KvCommand;
+        use crate::network::client::NetworkClient;
+        use crate::network::message::{NetworkEnvelope, NetworkMessage};
+        use crate::raft::election::state::ElectionState;
+        use crate::raft::log::LogEntry;
+        use crate::raft::replication::ReplicationState;
+        use crate::raft::rpc::AppendEntriesResponse;
+        use crate::raft::types::{LogIndex, NodeId, Term};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let peer_address = listener.local_addr().unwrap();
+
+        let leader = NodeConfig::new(NodeId::new(1), "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+
+        let peer = NodeConfig::new(NodeId::new(2), peer_address);
+
+        let cluster = ClusterConfig::new(vec![leader.clone(), peer]);
+        let config = RuntimeConfig::new(leader, cluster);
+
+        let mut runtime = NodeRuntime::bind(config).await.unwrap();
+        let leader_address = runtime.server_address().unwrap().unwrap();
+        let peer_id = NodeId::new(2);
+
+        // Prepare a leader with three log entries.
+        runtime.raft_mut().start_election();
+        runtime.raft_mut().become_leader();
+
+        runtime
+            .raft_mut()
+            .append_log_entry(LogEntry::new(Term::new(1), KvCommand::put("key", "one")));
+        runtime
+            .raft_mut()
+            .append_log_entry(LogEntry::new(Term::new(1), KvCommand::put("key", "two")));
+        runtime
+            .raft_mut()
+            .append_log_entry(LogEntry::new(Term::new(1), KvCommand::put("key", "three")));
+
+        // Simulate a leader that believes the follower has entries through index 2.
+        // Its next request will therefore start at index 3.
+        runtime.replication_mut().advance(peer_id, LogIndex::new(2));
+
+        assert_eq!(
+            runtime.replication().next_index(peer_id),
+            Some(LogIndex::new(3))
+        );
+
+        let receiver = tokio::spawn(async move {
+            // Receive the leader's first AppendEntries request.
+            let (stream, _) = timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .expect("timed out waiting for the first request")
+                .unwrap();
+
+            let mut client = NetworkClient::from_stream(stream);
+            let envelope = timeout(Duration::from_secs(3), client.receive_envelope())
+                .await
+                .expect("timed out receiving the first request")
+                .unwrap();
+
+            match envelope.message() {
+                NetworkMessage::AppendEntries(request) => {
+                    assert_eq!(request.prev_log_index, Some(LogIndex::new(2)));
+                    assert_eq!(request.entry_count(), 1);
+                }
+                other => panic!("expected first AppendEntries request, got {other:?}"),
+            }
+
+            client.shutdown().await.unwrap();
+
+            // Simulate the follower rejecting the first request by sending a
+            // failure response to the leader over TCP.
+            let failure = AppendEntriesResponse::failure(Term::new(1));
+            let response_envelope =
+                NetworkEnvelope::new(peer_id, NetworkMessage::AppendEntriesResponse(failure));
+
+            let mut response_client = NetworkClient::connect(leader_address).await.unwrap();
+
+            response_client
+                .send_envelope(&response_envelope)
+                .await
+                .unwrap();
+
+            response_client.shutdown().await.unwrap();
+
+            // Receive the leader's retry.
+            let (stream, _) = timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .expect("leader did not retry after backtracking")
+                .unwrap();
+
+            let mut retry_client = NetworkClient::from_stream(stream);
+            let retry_envelope = timeout(Duration::from_secs(3), retry_client.receive_envelope())
+                .await
+                .expect("timed out receiving the retry")
+                .unwrap();
+
+            match retry_envelope.message() {
+                NetworkMessage::AppendEntries(request) => {
+                    assert_eq!(request.prev_log_index, Some(LogIndex::new(1)));
+                    assert_eq!(request.entry_count(), 2);
+
+                    match request.entries[0].command() {
+                        KvCommand::Put { key, value } => {
+                            assert_eq!(key, "key");
+                            assert_eq!(value, "two");
+                        }
+                        other => panic!("expected second log entry, got {other:?}"),
+                    }
+
+                    match request.entries[1].command() {
+                        KvCommand::Put { key, value } => {
+                            assert_eq!(key, "key");
+                            assert_eq!(value, "three");
+                        }
+                        other => panic!("expected third log entry, got {other:?}"),
+                    }
+                }
+                other => panic!("expected retry AppendEntries request, got {other:?}"),
+            }
+
+            retry_client.shutdown().await.unwrap();
+        });
+
+        // Send the initial AppendEntries request.
+        runtime.advance_timer(Duration::from_millis(100));
+        runtime.tick().await.unwrap();
+
+        // Process the failure response received from the follower.
+        let mut election = ElectionState::new(2, Duration::from_millis(500));
+        let mut external_replication = ReplicationState::new();
+
+        timeout(
+            Duration::from_secs(3),
+            runtime.process_one_message(LogIndex::new(3), &mut election, &mut external_replication),
+        )
+        .await
+        .expect("timed out processing the failure response")
+        .unwrap();
+
+        // The failed response must move next_index back from 3 to 2.
+        assert_eq!(
+            runtime.replication().next_index(peer_id),
+            Some(LogIndex::new(2))
+        );
+
+        // Trigger another replication attempt.
+        runtime.advance_timer(Duration::from_millis(100));
+        runtime.tick().await.unwrap();
+
+        timeout(Duration::from_secs(5), receiver)
+            .await
+            .expect("timed out waiting for the TCP retry assertions")
+            .unwrap();
     }
 }

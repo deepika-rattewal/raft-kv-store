@@ -2500,4 +2500,28 @@ mod tests {
 
         client.await.unwrap();
     }
+
+    #[test]
+    fn failed_append_entries_response_moves_next_index_backwards() {
+        use crate::raft::replication::ReplicationState;
+        use crate::raft::rpc::AppendEntriesResponse;
+        use crate::raft::types::{LogIndex, NodeId, Term};
+
+        let mut node = RaftNode::new(NodeId::new(1));
+        node.start_election();
+        node.become_leader();
+
+        let peer = NodeId::new(2);
+        let mut replication = ReplicationState::new();
+
+        replication.add_peer(peer, LogIndex::new(4));
+
+        let response = AppendEntriesResponse::failure(Term::new(1));
+
+        let handled =
+            node.handle_append_entries_response(peer, LogIndex::new(3), response, &mut replication);
+
+        assert!(handled);
+        assert_eq!(replication.next_index(peer), Some(LogIndex::new(3)));
+    }
 }
